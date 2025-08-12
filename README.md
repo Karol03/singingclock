@@ -24,9 +24,6 @@ The ranges are configurable in `config.txt`. The time is based on DS3231 with op
 - MCU: Seeed XIAO ESP32S3
 - Audio/SD: Adafruit 5769 SD card amplifier module
 - RTC: DS3231 (accurate real-time clock)
-- Audio: 16-bit mono (PCM) WAV files
-- Configuration: via `config.txt` on the SD card
-- Time setting: via `timestamp.txt` (epoch, UTC+0) + optional DST in `config.txt`
 
 ## Wiring Overview
 I²C (RTC DS3231):
