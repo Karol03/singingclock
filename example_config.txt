@@ -1,0 +1,41 @@
+# ################################################################### #
+# This file is example config file. Copy it to sd card and rename to  #
+# 'config.txt' to apply options below.                                #
+# ################################################################### #
+# 
+# This file is configuration of playback options
+# each line must contain only <name>=<value> pairs
+# every line starts with # is a comment line
+
+# Alarm bits as stated :
+#
+# Dy	A2M4	A2M3	A2M2	Rate
+# X	1	1	1	Once per minute (at seconds = 00)
+# X	1	1	0	Alarm when minutes match
+# X	1	0	0	Alarm when hours and minutes match
+# 0	0	0	0	Alarm when date, hour, min match
+# 1	0	0	0	Alarm when DoW, hour, min match
+#
+# 0 means 0b0000 -> Alarm when date, hour, min match
+ALARM_BITS=0
+
+# 1 makes the alarm will fire on day of week, 0 makes the alarm will fire on day of month
+IS_DAYS_OF_WEEK=1
+
+# day will be random but no earlier than DAYS_AHEAD_MIN days 
+DAYS_AHEAD_MIN=1
+
+# day will be random but no later  than DAYS_AHEAD_MAX days 
+DAYS_AHEAD_MAX=3
+
+# hour will be random but no earlier than at SINCE_HOUR (24 hours clock)
+SINCE_HOUR=6
+
+# hour will be random but no later than at UNTIL_HOUR (24 hours clock)
+UNTIL_HOUR=20
+
+# minute will be random but no earlier than at SINCE_MIN (0-59 min)
+SINCE_MIN=0
+
+# minute will be random but no later than at UNTIL_MIN (0-59 min)
+UNTIL_MIN=59
