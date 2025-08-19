@@ -22,9 +22,10 @@ The ranges are configurable in `config.txt`. The time is based on DS3231 with op
 
 ## Hardware
 - MCU: Seeed XIAO ESP32S3
-- Audio/SD: Adafruit 5769 SD card amplifier module
+- Audio/SD: Adafruit 5769 SD card amplifier module (SD card formatted in FAT32 system)
 - RTC: DS3231 (accurate real-time clock)
 - IRFZ44N - N-channel MOSFET to drive Adafruit 5769 power supply
+
 
 ## Wiring Overview
 I²C (RTC DS3231):
