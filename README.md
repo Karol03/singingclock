@@ -24,9 +24,7 @@ The ranges are configurable in `config.txt`. The time is based on DS3231 with op
 - MCU: Seeed XIAO ESP32S3
 - Audio/SD: Adafruit 5769 SD card amplifier module
 - RTC: DS3231 (accurate real-time clock)
-- Audio: 16-bit mono (PCM) WAV files
-- Configuration: via `config.txt` on the SD card
-- Time setting: via `timestamp.txt` (epoch, UTC+0) + optional DST in `config.txt`
+- IRFZ44N - N-channel MOSFET to drive Adafruit 5769 power supply
 
 ## Wiring Overview
 I²C (RTC DS3231):
@@ -39,14 +37,16 @@ I²C (RTC DS3231):
 SPI (SD card on Adafruit 5769):
 
     MOSI, MISO, SCK → SPI pins on XIAO
-    CS_SD → A0 pin on XIAO
+    CS_SD → TX (GPIO43) pin on XIAO
 
 I²S (to amplifier on Adafruit 5769):
 
     BCLK → I²S BCK pin on XIAO (A3)
     LRC / WS → I²S LRCLK pin on XIAO (A2)
     DIN → I²S data pin on XIAO (A1)
-    Power: 3V3/5V & GND
+    5V → XIAO 5V 
+    3.3V → XIAO 3.3V
+    GND → N-MOSFET drain
 
 ## SD Card Structure
 SD card structure

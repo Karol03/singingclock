@@ -3,24 +3,39 @@
 #include "Audio_MAX98357A.h"
 #include "SD.h"
 #include "driver/rtc_io.h"
+#include <EEPROM.h>
+#include <Update.h>
+
+#define FIRMWARE_VERSION 1.00
 
 // Adafruit Audio BFF pinout taken from
 // https://learn.adafruit.com/adafruit-audio-bff/pinouts
 #define APLIFIER_BCLK A3
 #define APLIFIER_LRCLK A2
 #define APLIFIER_DATA A1
-#define SD_CHIP_SELECT_DATA A0
+#define SD_CHIP_SELECT_DATA GPIO_NUM_43
 #define RTC_INT_GPIO GPIO_NUM_1
+#define BFF_POWER_OFF GPIO_NUM_44
+
+#define DST_FLAG_ADDR 0
+
+#define clamp(value, min, max) ((value) < (min) ? (min) : ((value) > (max) ? (max) : (value)))
+
+#define PARSE_VARIABLE(name) if (strcmp(key, #name) == 0) { name = atoi(value); Serial.print("Changed defaul value of '"#name"' to "); Serial.println(name); }
 
 
-static byte ALARM_BITS = 0b00000000;
-static bool IS_DAYS_OF_WEEK = true;
 static unsigned DAYS_AHEAD_MIN = 1u;
 static unsigned DAYS_AHEAD_MAX = 3u;
 static unsigned SINCE_HOUR = 6u;
 static unsigned UNTIL_HOUR = 20u;
 static unsigned SINCE_MIN = 0u;
 static unsigned UNTIL_MIN = 59u;
+static int UTC_OFFSET = 0;
+static unsigned ENABLE_DAYLIGHT_SAVING_TIME = 0;
+static int DAYLIGHT_SAVING_TIME_OFFSET = 0;
+static unsigned SUMMER_TIME_START_MONTH = 0u;
+static unsigned SUMMER_TIME_START_END = 0u;
+static unsigned VOLUME = 4;
 
 
 Audio_MAX98357A amplifier;
@@ -34,7 +49,12 @@ static int isSerialEnabled = -1;
 #define WAIT_FOR_SERIAL_SINGLE_TIME() do { if (isSerialEnabled == -1) { for (int i = 0; i < (WAIT_FOR_SERIAL_FOR_S * 20) && !Serial; ++i) delay(50); isSerialEnabled = !!Serial; } } while(0)
 
 void setup() {
-  digitalWrite(LED_BUILTIN, HIGH);
+  EEPROM.begin(1);  // single byte for checking daylight saving time
+
+  digitalWrite(LED_BUILTIN, LOW);
+
+  pinMode(BFF_POWER_OFF, OUTPUT);
+  digitalWrite(BFF_POWER_OFF, HIGH);
 
   Wire.begin();
   Serial.begin(115200);
@@ -45,7 +65,6 @@ void setup() {
   while (!amplifier.initI2S(/*_bclk=*/APLIFIER_BCLK, /*_lrclk=*/APLIFIER_LRCLK, /*_din=*/APLIFIER_DATA))
   {
     Serial.println("Initialize I2S failed !");
-    delay(1000);
     if (i > 10)
     {
       end();
@@ -57,7 +76,6 @@ void setup() {
   while (!amplifier.initSDCard(/*csPin=*/SD_CHIP_SELECT_DATA))
   {
     Serial.println("Initialize SD card failed !");
-    delay(1000);
     if (i > 10)
     {
       end();
@@ -67,22 +85,26 @@ void setup() {
 
   Serial.println("Initialize succeed!");
 
+  firmwareUpdate();
+
   setTime();
 
   loadConfig();
 
+  updateForDaylightTime();  // must be called after loadConfig to first load required variables from file
+
   amplifier.scanSDMusic(musicList);
   printMusicList();
-  amplifier.setVolume(5);
+  VOLUME = clamp(VOLUME, 1, 9);
+  amplifier.setVolume(VOLUME);
   amplifier.closeFilter();
 
   playRandom();
 
-  digitalWrite(LED_BUILTIN, LOW);
-
-  setNextAlarm();
-
-  esp_deep_sleep_start();
+  Serial.print("Finished v");
+  Serial.println(FIRMWARE_VERSION);
+  
+  end();
 }
 
 void loop() {  
@@ -120,6 +142,52 @@ void trim(char* str)
     *(end + 1) = '\0';
 }
 
+bool isSummerTimeNow()
+{
+  bool century;
+  byte month = Clock.getMonth(century);
+  if (SUMMER_TIME_START_MONTH < SUMMER_TIME_START_END)
+  {
+    return (SUMMER_TIME_START_MONTH <= month && month <= SUMMER_TIME_START_END);
+  }
+  return (month <= SUMMER_TIME_START_MONTH || SUMMER_TIME_START_END <= month);
+}
+
+void updateForDaylightTime()
+{
+  if (!ENABLE_DAYLIGHT_SAVING_TIME || DAYLIGHT_SAVING_TIME_OFFSET == 0)
+  {
+    EEPROM.end();
+    return;
+  }
+
+  bool isSummerTime = isSummerTimeNow();
+  uint8_t dstFlag = EEPROM.read(DST_FLAG_ADDR);
+  const uint8_t SUMMER_TIME_FLAG = 0xAB;
+  const uint8_t WINTER_TIME_FLAG = 0xBC;
+  if (dstFlag != SUMMER_TIME_FLAG && isSummerTime)
+  {
+    // set summer time
+    uint64_t epoch_time = myRTC.now().unixtime() + int64_t(DAYLIGHT_SAVING_TIME_OFFSET) * 3600ull;
+    Clock.setEpoch(epoch_time, false);
+    Clock.setClockMode(false);
+    EEPROM.write(DST_FLAG_ADDR, SUMMER_TIME_FLAG);   // set daylight summer time flag 
+    EEPROM.commit();
+    Serial.println("Update to daylight summer time");
+  }
+  else if (dstFlag != WINTER_TIME_FLAG && !isSummerTime)
+  {
+    // set winter time
+    uint64_t epoch_time = myRTC.now().unixtime() - int64_t(DAYLIGHT_SAVING_TIME_OFFSET) * 3600ull;
+    Clock.setEpoch(epoch_time, false);
+    Clock.setClockMode(false);
+    EEPROM.write(DST_FLAG_ADDR, WINTER_TIME_FLAG);   // set daylight summer time flag 
+    EEPROM.commit();
+    Serial.println("Update to winter time");
+  }
+  EEPROM.end();
+}
+
 void loadConfig()
 {
     FILE* file = fopen("/sd/config.txt", "r");
@@ -149,46 +217,18 @@ void loadConfig()
         trim(key);
         trim(value);
 
-        if (strcmp(key, "IS_DAYS_OF_WEEK") == 0)
-        {
-          IS_DAYS_OF_WEEK = atoi(value);
-          Serial.print("Changed defaul value of 'IS_DAYS_OF_WEEK' to "); Serial.println(IS_DAYS_OF_WEEK);
-        }
-        else if (strcmp(key, "ALARM_BITS") == 0)
-        {
-          ALARM_BITS = atoi(value);
-          Serial.print("Changed defaul value of 'ALARM_BITS' to "); Serial.println(ALARM_BITS);
-        }
-        else if (strcmp(key, "DAYS_AHEAD_MIN") == 0)
-        {
-          DAYS_AHEAD_MIN = atoi(value);
-          Serial.print("Changed defaul value of 'DAYS_AHEAD_MIN' to "); Serial.println(DAYS_AHEAD_MIN);
-        }
-        else if (strcmp(key, "DAYS_AHEAD_MAX") == 0)
-        {
-          DAYS_AHEAD_MAX = atoi(value);
-          Serial.print("Changed defaul value of 'DAYS_AHEAD_MAX' to "); Serial.println(DAYS_AHEAD_MAX);
-        }
-        else if (strcmp(key, "SINCE_HOUR") == 0)
-        {
-          SINCE_HOUR = atoi(value);
-          Serial.print("Changed defaul value of 'SINCE_HOUR' to "); Serial.println(SINCE_HOUR);
-        }
-        else if (strcmp(key, "UNTIL_HOUR") == 0)
-        {
-          UNTIL_HOUR = atoi(value);
-          Serial.print("Changed defaul value of 'UNTIL_HOUR' to "); Serial.println(UNTIL_HOUR);
-        }
-        else if (strcmp(key, "SINCE_MIN") == 0)
-        {
-          SINCE_MIN = atoi(value);
-          Serial.print("Changed defaul value of 'SINCE_MIN' to "); Serial.println(SINCE_MIN);
-        }
-        else if (strcmp(key, "UNTIL_MIN") == 0)
-        {
-          UNTIL_MIN = atoi(value);
-          Serial.print("Changed defaul value of 'UNTIL_MIN' to "); Serial.println(UNTIL_MIN);
-        }
+        PARSE_VARIABLE(DAYS_AHEAD_MIN)
+        else PARSE_VARIABLE(DAYS_AHEAD_MAX)
+        else PARSE_VARIABLE(SINCE_HOUR)
+        else PARSE_VARIABLE(UNTIL_HOUR)
+        else PARSE_VARIABLE(SINCE_MIN)
+        else PARSE_VARIABLE(UNTIL_MIN)
+        else PARSE_VARIABLE(UTC_OFFSET)
+        else PARSE_VARIABLE(ENABLE_DAYLIGHT_SAVING_TIME)
+        else PARSE_VARIABLE(DAYLIGHT_SAVING_TIME_OFFSET)
+        else PARSE_VARIABLE(SUMMER_TIME_START_MONTH)
+        else PARSE_VARIABLE(SUMMER_TIME_START_END)
+        else PARSE_VARIABLE(VOLUME)
     }
 
     Serial.println("Config loaded from file");
@@ -207,21 +247,62 @@ void playRandom()
 
 void saveLog(byte alarmDay, byte alarmHour, byte alarmMinute)
 {
-  const char* DAY_ARR[] = {"<err>", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
+  const char* MONTH_ARR[] = {"<err>", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
   FILE* fp = fopen("/sd/log.txt", "a");
-  DateTime datetime = myRTC.now();
   if (!fp)
     return;
 
+  bool century;
+  DateTime datetime = myRTC.now();
   const uint64_t epochTime = datetime.unixtime();
-  if (fprintf(fp, "Called at %llu (%s %02u:%02u), next alarm at %s %02u:%02u\n",
+  byte currentMonth = Clock.getMonth(century);
+  byte currentDate = Clock.getDate();
+  byte nextMonth = currentDate > alarmDay ? (currentMonth % 12 + 1) : currentMonth;
+  if (fprintf(fp, "Called at %llu (%u %s %02u:%02u), next alarm at %u %s %02u:%02u\n",
     (unsigned long long)epochTime,
-    DAY_ARR[Clock.getDoW()], datetime.hour(), datetime.minute(),
-    DAY_ARR[alarmDay], alarmHour, alarmMinute) < 0)
+    currentDate, MONTH_ARR[currentMonth], datetime.hour(), datetime.minute(),
+    alarmDay, MONTH_ARR[nextMonth], alarmHour, alarmMinute) < 0)
   {
       Serial.println("Failed to save timestamp in log.txt\n");
   }
   fclose(fp);
+}
+
+void firmwareUpdate()
+{
+  File firmware =  SD.open("/firmware.bin");
+  if (firmware) 
+  {
+      Serial.println("Updating the firmware...");
+      Update.begin(firmware.size(), U_FLASH);
+      Update.writeStream(firmware);
+      if (Update.end())
+      {
+          firmware.close();
+          SD.remove("/firmware.bin");
+          Serial.println("Firmware updated!");
+          FILE* fp = fopen("/sd/log.txt", "a");
+          if (fp)
+          {
+            fprintf(fp, "Firmware updated!\n");
+            fclose(fp);
+          }
+          delay(200);
+          ESP.restart();
+      }
+      else
+      {
+          firmware.close();
+          Serial.println("Failed to update firmware!");
+          Serial.println(Update.getError());
+          FILE* fp = fopen("/sd/log.txt", "a");
+          if (fp)
+          {
+            fprintf(fp, "Failed to update the firmware, err = %u\n", Update.getError());
+            fclose(fp);
+          }
+      }
+  }
 }
 
 void setTime()
@@ -256,45 +337,44 @@ void setTime()
       Serial.println("Failed to remove timestamp file\n");
       return;
   }
+
+  epoch_time += UTC_OFFSET * 3600;
+
   Clock.setEpoch(epoch_time, false);
   Clock.setClockMode(false);
+
   Serial.print("Epoch time updated : "); Serial.println(epoch_time);
+
+  EEPROM.write(DST_FLAG_ADDR, 0);   // set daylight summer time flag
+  EEPROM.commit();
 }
 
-byte calculateNextAlarmDate()
+byte calculateNextAlarmDate(byte alarmHour, byte alarmMinute)
 {
-  if (IS_DAYS_OF_WEEK)
-  {
-    // calculate in week days
-    const byte DAYS_IN_WEEK = 7;
-    byte addDays;
-    if (DAYS_AHEAD_MAX >= 7)
-      DAYS_AHEAD_MAX = 6;
-    if (DAYS_AHEAD_MIN > DAYS_AHEAD_MAX)
-      return Clock.getDoW();
-    else if (DAYS_AHEAD_MIN == DAYS_AHEAD_MAX)
-      addDays = DAYS_AHEAD_MIN;
-    else
-      addDays = (esp_random() % (DAYS_AHEAD_MAX - DAYS_AHEAD_MIN + 1)) + DAYS_AHEAD_MIN;
-    return ((Clock.getDoW() + addDays - 1) % DAYS_IN_WEEK) + 1;
-  }
-  else
-  {
     // calculate in month days
-    static const byte daysInMonth[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    static const byte daysInMonth[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
     bool century;
     int  year   = Clock.getYear() + 2000;
     byte month = Clock.getMonth(century);
-    byte dim = daysInMonth[month - 1];
+    byte dim = daysInMonth[month];
     byte addDays;
-    if (DAYS_AHEAD_MAX >= 29)
-      DAYS_AHEAD_MAX = 28;
+    DAYS_AHEAD_MIN = clamp(DAYS_AHEAD_MIN, 0, 28);
+    DAYS_AHEAD_MAX = clamp(DAYS_AHEAD_MAX, 0, 28);
     if (DAYS_AHEAD_MIN > DAYS_AHEAD_MAX)
       return Clock.getDate();
     if (DAYS_AHEAD_MIN == DAYS_AHEAD_MAX)
       addDays = DAYS_AHEAD_MIN;
     else
       addDays = (esp_random() % (DAYS_AHEAD_MAX - DAYS_AHEAD_MIN + 1)) + DAYS_AHEAD_MIN;
+    if (addDays == 0)
+    {
+      DateTime datetime = myRTC.now();
+      if (datetime.hour() > alarmHour || (datetime.hour() == alarmHour && datetime.minute() >= alarmMinute - 2))
+      {
+        // If a date and time from the past was drawn, add a single day 
+        addDays = 1;
+      }
+    }
     byte newDate = Clock.getDate() + addDays;
     if (month == 2 && ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0))) {
       dim = 29;
@@ -302,24 +382,23 @@ byte calculateNextAlarmDate()
     if (newDate > dim)
       newDate -= dim;
     return newDate;
-  }
 }
 
 byte calculateNextAlarmHour()
 {
-    if (UNTIL_HOUR >= 24)
-      UNTIL_HOUR = 23;
+    SINCE_HOUR = clamp(SINCE_HOUR, 0, 23);
+    UNTIL_HOUR = clamp(UNTIL_HOUR, 0, 23);
     if (SINCE_HOUR >= UNTIL_HOUR)
-      return SINCE_HOUR % 24;
+      return SINCE_HOUR;
     return (esp_random() % (UNTIL_HOUR - SINCE_HOUR + 1)) + SINCE_HOUR;
 }
 
 byte calculateNextAlarmMinute()
 {
-    if (UNTIL_MIN >= 60)
-      UNTIL_MIN = 59;
+    SINCE_MIN = clamp(SINCE_MIN, 0, 59);
+    UNTIL_MIN = clamp(UNTIL_MIN, 0, 59);
     if (SINCE_MIN >= UNTIL_MIN)
-      return SINCE_MIN % 60;
+      return SINCE_MIN;
     return (esp_random() % (UNTIL_MIN - SINCE_MIN + 1)) + SINCE_MIN;
 }
 
@@ -335,11 +414,11 @@ void setNextAlarm()
     const unsigned MINUTES_IN_HOUR = 60;
     bool alarmH12 = false;
     bool alarmPM = false;
-    byte alarmDay = calculateNextAlarmDate();
     byte alarmHour = calculateNextAlarmHour();
     byte alarmMinute = calculateNextAlarmMinute();
-    byte alarmBits = (IS_DAYS_OF_WEEK ? 0b00001000 : 0b00000000) | ALARM_BITS; // 0b00001000; // alarm when DoW, hour, minute match
-    byte a1dy = IS_DAYS_OF_WEEK; // true makes the alarm go on A1Day = Day of Week
+    byte alarmDay = calculateNextAlarmDate(alarmHour, alarmMinute);
+    byte alarmBits = 0b00000000; // alarm when DoM, hour, minute match
+    byte a1dy = false; // true makes the alarm go on A1Day = Day of Week, false - Day of Month
 
     saveLog(alarmDay, alarmHour, alarmMinute);
 
