@@ -49,6 +49,14 @@ I²S (to amplifier on Adafruit 5769):
     3.3V → XIAO 3.3V
     GND → N-MOSFET drain
 
+N-MOSFET:
+
+    SOURCE → GND
+    DRAIN → Adafruit 5769 GND
+    GATE → GPIO_NUM_44 (by 100 Ohm)
+    GND → GATE (by 10 kOhm)
+    
+
 ## SD Card Structure
 SD card structure
 
