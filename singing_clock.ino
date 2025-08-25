@@ -1,3 +1,6 @@
+#include <stdio.h>
+#include <stdint.h>
+
 #include <Wire.h>
 #include "ds3231.h"
 #include "Audio_MAX98357A.h"
@@ -6,7 +9,7 @@
 #include <EEPROM.h>
 #include <Update.h>
 
-#define FIRMWARE_VERSION 1.00
+#define FIRMWARE_VERSION 1.01
 
 // Adafruit Audio BFF pinout taken from
 // https://learn.adafruit.com/adafruit-audio-bff/pinouts
@@ -21,7 +24,7 @@
 
 #define clamp(value, min, max) ((value) < (min) ? (min) : ((value) > (max) ? (max) : (value)))
 
-#define PARSE_VARIABLE(name) if (strcmp(key, #name) == 0) { name = atoi(value); Serial.print("Changed defaul value of '"#name"' to "); Serial.println(name); }
+#define PARSE_VARIABLE(name) if (strcmp(key, #name) == 0) { name = atoi(value); buffor += "Changed default value of '"#name"' to "; buffor += value; buffor += '\n';}
 
 
 static unsigned DAYS_AHEAD_MIN = 1u;
@@ -34,7 +37,7 @@ static int UTC_OFFSET = 0;
 static unsigned ENABLE_DAYLIGHT_SAVING_TIME = 0;
 static int DAYLIGHT_SAVING_TIME_OFFSET = 0;
 static unsigned SUMMER_TIME_START_MONTH = 0u;
-static unsigned SUMMER_TIME_START_END = 0u;
+static unsigned SUMMER_TIME_END_MONTH = 0u;
 static unsigned VOLUME = 4;
 
 
@@ -64,7 +67,7 @@ void setup() {
   int i = 0;
   while (!amplifier.initI2S(/*_bclk=*/APLIFIER_BCLK, /*_lrclk=*/APLIFIER_LRCLK, /*_din=*/APLIFIER_DATA))
   {
-    Serial.println("Initialize I2S failed !");
+    Serial.println("Initialize I2S failed !"); // only console, as sd card not available
     if (i > 10)
     {
       end();
@@ -75,7 +78,7 @@ void setup() {
   i = 0;
   while (!amplifier.initSDCard(/*csPin=*/SD_CHIP_SELECT_DATA))
   {
-    Serial.println("Initialize SD card failed !");
+    LOG_PRINT("Initialize SD card failed !");
     if (i > 10)
     {
       end();
@@ -83,7 +86,7 @@ void setup() {
     ++i;
   }
 
-  Serial.println("Initialize succeed!");
+  LOG_PRINT("Initialize succeed!");
 
   firmwareUpdate();
 
@@ -95,14 +98,13 @@ void setup() {
 
   amplifier.scanSDMusic(musicList);
   printMusicList();
+  amplifier.closeFilter();
   VOLUME = clamp(VOLUME, 1, 9);
   amplifier.setVolume(VOLUME);
-  amplifier.closeFilter();
 
   playRandom();
 
-  Serial.print("Finished v");
-  Serial.println(FIRMWARE_VERSION);
+  LOG_PRINT("Program finished. Version", FIRMWARE_VERSION);
   
   end();
 }
@@ -146,11 +148,11 @@ bool isSummerTimeNow()
 {
   bool century;
   byte month = Clock.getMonth(century);
-  if (SUMMER_TIME_START_MONTH < SUMMER_TIME_START_END)
+  if (SUMMER_TIME_START_MONTH < SUMMER_TIME_END_MONTH)
   {
-    return (SUMMER_TIME_START_MONTH <= month && month <= SUMMER_TIME_START_END);
+    return (SUMMER_TIME_START_MONTH <= month && month <= SUMMER_TIME_END_MONTH);
   }
-  return (month <= SUMMER_TIME_START_MONTH || SUMMER_TIME_START_END <= month);
+  return (month <= SUMMER_TIME_START_MONTH || SUMMER_TIME_END_MONTH <= month);
 }
 
 void updateForDaylightTime()
@@ -173,7 +175,7 @@ void updateForDaylightTime()
     Clock.setClockMode(false);
     EEPROM.write(DST_FLAG_ADDR, SUMMER_TIME_FLAG);   // set daylight summer time flag 
     EEPROM.commit();
-    Serial.println("Update to daylight summer time");
+    LOG_PRINT("Update to daylight summer time");
   }
   else if (dstFlag != WINTER_TIME_FLAG && !isSummerTime)
   {
@@ -183,7 +185,7 @@ void updateForDaylightTime()
     Clock.setClockMode(false);
     EEPROM.write(DST_FLAG_ADDR, WINTER_TIME_FLAG);   // set daylight summer time flag 
     EEPROM.commit();
-    Serial.println("Update to winter time");
+    LOG_PRINT("Update to winter time");
   }
   EEPROM.end();
 }
@@ -193,12 +195,11 @@ void loadConfig()
     FILE* file = fopen("/sd/config.txt", "r");
     if (!file)
     {
-        Serial.println("Failed to open config file, use default values");
+        LOG_PRINT("Failed to open config file, use default values");
         return;
     }
 
-    WAIT_FOR_SERIAL_SINGLE_TIME();
-
+    String buffor;
     char line[512];
     unsigned count = 0;
 
@@ -223,16 +224,16 @@ void loadConfig()
         else PARSE_VARIABLE(UNTIL_HOUR)
         else PARSE_VARIABLE(SINCE_MIN)
         else PARSE_VARIABLE(UNTIL_MIN)
+        else PARSE_VARIABLE(VOLUME)
         else PARSE_VARIABLE(UTC_OFFSET)
         else PARSE_VARIABLE(ENABLE_DAYLIGHT_SAVING_TIME)
         else PARSE_VARIABLE(DAYLIGHT_SAVING_TIME_OFFSET)
         else PARSE_VARIABLE(SUMMER_TIME_START_MONTH)
-        else PARSE_VARIABLE(SUMMER_TIME_START_END)
-        else PARSE_VARIABLE(VOLUME)
+        else PARSE_VARIABLE(SUMMER_TIME_END_MONTH)
     }
 
-    Serial.println("Config loaded from file");
     fclose(file);
+    LOG_PRINT(buffor.c_str(), "\nConfig loaded from file");
 }
 
 void playRandom()
@@ -240,9 +241,75 @@ void playRandom()
   if (numberOfTracks > 0)
   {
     const unsigned trackNo = esp_random() % numberOfTracks;
+    LOG_PRINT("Play track : ", musicList[trackNo].c_str());
     amplifier.playSDMusic(musicList[trackNo].c_str());
     do { delay(200); } while (!amplifier.isStopped());
   }
+}
+
+inline String u64ToStr(uint64_t v)
+{
+  char buf[21];
+  int pos = 20;
+  buf[pos] = '\0';
+  do {
+    uint64_t digit = v % 10;
+    v /= 10;
+    buf[--pos] = char('0' + digit);
+  } while (v);
+  return String(&buf[pos]);
+}
+
+inline String i64ToStr(int64_t v)
+{
+  if (v < 0) {
+    uint64_t u = uint64_t(-(v + 1)) + 1;
+    return String('-') + u64ToStr(u);
+  } else {
+    return u64ToStr(uint64_t(v));
+  }
+}
+
+template<typename T>
+inline void singleSerialPrint(const T& x) { Serial.print(x); }
+inline void singleSerialPrint(uint64_t v) { Serial.print(u64ToStr(v)); }
+inline void singleSerialPrint(int64_t v)  { Serial.print(i64ToStr(v)); }
+
+template<typename... Args>
+inline void printSerial(const Args&... args) {
+  const char* sep = " ";
+  ( (singleSerialPrint(args), Serial.print(sep)), ... );
+  Serial.println();
+  Serial.flush();
+}
+
+template<typename T>
+inline String singleLogPrint(T&& x) { return String(std::forward<T>(x)); }
+inline String singleLogPrint(uint64_t v) { return u64ToStr(v); }
+inline String singleLogPrint(int64_t v)  { return i64ToStr(v); }
+
+template <typename... Args>
+void printLog(Args&&... args)
+{
+  FILE* fp = fopen("/sd/log.txt", "a");
+  if (!fp) return;
+
+  const char* sep = "";
+  ( (fprintf(fp, "%s", sep),
+     fprintf(fp, "%s", singleLogPrint(std::forward<Args>(args)).c_str()),
+     sep = " "), ... );
+  fprintf(fp, "\n");
+  fclose(fp);
+}
+
+template <typename... Args>
+void LOG_PRINT(Args&&... args)
+{
+    WAIT_FOR_SERIAL_SINGLE_TIME();
+    if (Serial)
+        printSerial(std::forward<Args>(args)...);
+    else
+        printLog(std::forward<Args>(args)...);
 }
 
 void saveLog(byte alarmDay, byte alarmHour, byte alarmMinute)
@@ -263,7 +330,7 @@ void saveLog(byte alarmDay, byte alarmHour, byte alarmMinute)
     currentDate, MONTH_ARR[currentMonth], datetime.hour(), datetime.minute(),
     alarmDay, MONTH_ARR[nextMonth], alarmHour, alarmMinute) < 0)
   {
-      Serial.println("Failed to save timestamp in log.txt\n");
+      Serial.println("Failed to save timestamp in log.txt");  // only serial here
   }
   fclose(fp);
 }
@@ -273,34 +340,21 @@ void firmwareUpdate()
   File firmware =  SD.open("/firmware.bin");
   if (firmware) 
   {
-      Serial.println("Updating the firmware...");
+      LOG_PRINT("Updating the firmware...");
       Update.begin(firmware.size(), U_FLASH);
       Update.writeStream(firmware);
       if (Update.end())
       {
           firmware.close();
           SD.remove("/firmware.bin");
-          Serial.println("Firmware updated!");
-          FILE* fp = fopen("/sd/log.txt", "a");
-          if (fp)
-          {
-            fprintf(fp, "Firmware updated!\n");
-            fclose(fp);
-          }
+          LOG_PRINT("Firmware updated!");
           delay(200);
           ESP.restart();
       }
       else
       {
           firmware.close();
-          Serial.println("Failed to update firmware!");
-          Serial.println(Update.getError());
-          FILE* fp = fopen("/sd/log.txt", "a");
-          if (fp)
-          {
-            fprintf(fp, "Failed to update the firmware, err = %u\n", Update.getError());
-            fclose(fp);
-          }
+          LOG_PRINT("Failed to update the firmware, err = ", Update.getError());
       }
   }
 }
@@ -308,11 +362,10 @@ void firmwareUpdate()
 void setTime()
 {
   DateTime datetime = myRTC.now();
-  Serial.print("Unix time is "); Serial.println(datetime.unixtime());
-  Serial.print("Compilation time "); Serial.println(__DATE_TIME_UNIX__);
+  LOG_PRINT("Unix time is", datetime.unixtime(), "\nCompilation time", __DATE_TIME_UNIX__);
   if (datetime.unixtime() < __DATE_TIME_UNIX__) // enter here on first startup or after battery replacing
   {
-    Clock.setEpoch(__DATE_TIME_UNIX__, false);
+    Clock.setEpoch(__DATE_TIME_UNIX__, true);
     Clock.setClockMode(false);
   }
 
@@ -320,30 +373,30 @@ void setTime()
   if (!fp)
     return;
 
-  WAIT_FOR_SERIAL_SINGLE_TIME();
-
-  Serial.println("Found new timestamp");
   uint64_t epoch_time;
-  if (fscanf(fp, "%" SCNu64, &epoch_time) != 1)
-  {
-      Serial.println("Failed to read number from timestamp file\n");
-      fclose(fp);
-      return;
-  }
+  bool isLoaded = (fscanf(fp, "%" SCNu64, &epoch_time) == 1);
   fclose(fp);
+
+  LOG_PRINT("Found new timestamp");
+  if (!isLoaded)
+  {
+    LOG_PRINT("Failed to read number from timestamp file");
+    return;
+  }
   
   if (!SD.remove("/timestamp.txt"))
   {
-      Serial.println("Failed to remove timestamp file\n");
+      LOG_PRINT("Failed to remove timestamp file");
       return;
   }
 
+  UTC_OFFSET = clamp(UTC_OFFSET, -12, 12);
   epoch_time += UTC_OFFSET * 3600;
 
   Clock.setEpoch(epoch_time, false);
   Clock.setClockMode(false);
 
-  Serial.print("Epoch time updated : "); Serial.println(epoch_time);
+  LOG_PRINT("Epoch time updated : ", epoch_time);
 
   EEPROM.write(DST_FLAG_ADDR, 0);   // set daylight summer time flag
   EEPROM.commit();
@@ -440,22 +493,14 @@ void printMusicList(void)
 {
   numberOfTracks = 0;
 
-  if(musicList[numberOfTracks].length())
+  if(musicList[numberOfTracks].length() == 0)
   {
-    Serial.println("\nMusic List: ");
-  }
-  else
-  {
-    Serial.println("The SD card audio file scan is empty, please check whether there are audio files in the SD card that meet the format!");
+    LOG_PRINT("The SD card audio file scan is empty, please check whether there are audio files in the SD card that meet the format!");
   }
 
   while (musicList[numberOfTracks].length())
   {
-    Serial.print("\t");
-    Serial.print(numberOfTracks);
-    Serial.print("  -  ");
-    Serial.println(musicList[numberOfTracks]);
     numberOfTracks++;
   }
+  LOG_PRINT("Music list found", numberOfTracks, "tracks");
 }
-
