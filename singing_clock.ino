@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdint.h>
 
+#include <WiFi.h>
 #include <Wire.h>
 #include "ds3231.h"
 #include "Audio_MAX98357A.h"
@@ -16,11 +17,13 @@
 #define APLIFIER_BCLK A3
 #define APLIFIER_LRCLK A2
 #define APLIFIER_DATA A1
-#define SD_CHIP_SELECT_DATA GPIO_NUM_43
+#define SD_CHIP_SELECT_DATA A0
 #define RTC_INT_GPIO GPIO_NUM_1
 #define BFF_POWER_OFF GPIO_NUM_44
 
+#define SLEEP_LIMIT_SECONDS 360ULL
 #define DST_FLAG_ADDR 0
+#define NEXT_ALARM_TIME_ADDR 1
 
 #define clamp(value, min, max) ((value) < (min) ? (min) : ((value) > (max) ? (max) : (value)))
 
@@ -49,18 +52,33 @@ DS3231 Clock;
 static int isSerialEnabled = -1;
 
 #define WAIT_FOR_SERIAL_FOR_S 2
-#define WAIT_FOR_SERIAL_SINGLE_TIME() do { if (isSerialEnabled == -1) { for (int i = 0; i < (WAIT_FOR_SERIAL_FOR_S * 20) && !Serial; ++i) delay(50); isSerialEnabled = !!Serial; } } while(0)
+#define WAIT_FOR_SERIAL_SINGLE_TIME() do { if (isSerialEnabled == -1) { for (int i = 0; i < (WAIT_FOR_SERIAL_FOR_S * 10) && !Serial; ++i) delay(50); isSerialEnabled = !!Serial; } } while(0)
 
 void setup() {
-  EEPROM.begin(1);  // single byte for checking daylight saving time
+  btStop();                 // BT not needed
+  WiFi.mode(WIFI_OFF);      // wifi not needed
+  setCpuFrequencyMhz(80);   // slow down CPU for energy efficency
 
-  digitalWrite(LED_BUILTIN, LOW);
-
-  pinMode(BFF_POWER_OFF, OUTPUT);
-  digitalWrite(BFF_POWER_OFF, HIGH);
+  EEPROM.begin(9);  // single byte for checking daylight saving time
+                    // 8 bytes, next alarm time
 
   Wire.begin();
   Serial.begin(115200);
+
+  uint64_t nextAlarmTime;
+  EEPROM.get(NEXT_ALARM_TIME_ADDR, nextAlarmTime);
+  uint64_t now = myRTC.now().unixtime();
+
+  if (nextAlarmTime + 10ULL < now)
+  {
+    // justSleep(nextAlarmTime - now);
+    // return;
+  }  // no need to sleep for less than 10 seconds, just do all the stuff
+
+  LOG_PRINT("Woke-up at", now, "loaded alarm timestamp is", nextAlarmTime);
+
+  pinMode(BFF_POWER_OFF, OUTPUT);
+  digitalWrite(BFF_POWER_OFF, HIGH);
 
   turnOffTheAlarm();
 
@@ -86,8 +104,6 @@ void setup() {
     ++i;
   }
 
-  LOG_PRINT("Initialize succeed!");
-
   firmwareUpdate();
 
   setTime();
@@ -112,16 +128,25 @@ void setup() {
 void loop() {  
 }
 
+void justSleep(uint64_t seconds)
+{
+  seconds = clamp(seconds, 1ULL, SLEEP_LIMIT_SECONDS);
+  esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
+  esp_deep_sleep_start();
+}
+
 void end()
 {
-  digitalWrite(LED_BUILTIN, LOW);
+  EEPROM.end();
   setNextAlarm();
-  esp_deep_sleep_start();
+  justSleep(SLEEP_LIMIT_SECONDS);
 }
 
 void turnOffTheAlarm()
 {
-    rtc_gpio_deinit(RTC_INT_GPIO);  // deinit to use A0 as CS gpio
+    // rtc_gpio_deinit(RTC_INT_GPIO);  // deinit to use A0 as CS gpio
+
+    Clock.enable32kHz(false);
 
     // turn off the alarms
     Clock.turnOffAlarm(1);
@@ -159,7 +184,6 @@ void updateForDaylightTime()
 {
   if (!ENABLE_DAYLIGHT_SAVING_TIME || DAYLIGHT_SAVING_TIME_OFFSET == 0)
   {
-    EEPROM.end();
     return;
   }
 
@@ -173,7 +197,7 @@ void updateForDaylightTime()
     uint64_t epoch_time = myRTC.now().unixtime() + int64_t(DAYLIGHT_SAVING_TIME_OFFSET) * 3600ull;
     Clock.setEpoch(epoch_time, false);
     Clock.setClockMode(false);
-    EEPROM.write(DST_FLAG_ADDR, SUMMER_TIME_FLAG);   // set daylight summer time flag 
+    EEPROM.put(DST_FLAG_ADDR, SUMMER_TIME_FLAG);   // set daylight summer time flag 
     EEPROM.commit();
     LOG_PRINT("Update to daylight summer time");
   }
@@ -187,7 +211,6 @@ void updateForDaylightTime()
     EEPROM.commit();
     LOG_PRINT("Update to winter time");
   }
-  EEPROM.end();
 }
 
 void loadConfig()
@@ -422,7 +445,8 @@ byte calculateNextAlarmDate(byte alarmHour, byte alarmMinute)
     if (addDays == 0)
     {
       DateTime datetime = myRTC.now();
-      if (datetime.hour() > alarmHour || (datetime.hour() == alarmHour && datetime.minute() >= alarmMinute - 2))
+      if (datetime.hour() > alarmHour ||
+          (datetime.hour() == alarmHour && (datetime.minute() + (SLEEP_LIMIT_SECONDS / 60)) >= alarmMinute))
       {
         // If a date and time from the past was drawn, add a single day 
         addDays = 1;
@@ -475,18 +499,21 @@ void setNextAlarm()
 
     saveLog(alarmDay, alarmHour, alarmMinute);
 
-    Clock.setA2Time(
-       alarmDay, alarmHour, alarmMinute,
-       alarmBits, a1dy, alarmH12, alarmPM);
-    Clock.checkIfAlarm(2);
-    // now it is safe to enable interrupt output
-    Clock.turnOnAlarm(2);
+    DateTime datetime = myRTC.now();
+    DateTime nextAlarm = DateTime(datetime.year(), datetime.month(), alarmDay,
+                                  alarmHour, alarmMinute, 0);
+    uint64_t nextAlarmEpochTime = nextAlarm.unixtime();
 
-    rtc_gpio_init(RTC_INT_GPIO);
-    rtc_gpio_set_direction(RTC_INT_GPIO, RTC_GPIO_MODE_INPUT_ONLY);
-    rtc_gpio_pulldown_dis(RTC_INT_GPIO);
-    rtc_gpio_pullup_en(RTC_INT_GPIO);
-    esp_sleep_enable_ext0_wakeup(RTC_INT_GPIO, 0);
+    LOG_PRINT("Next epoch time to call", nextAlarmEpochTime);
+
+    EEPROM.put(NEXT_ALARM_TIME_ADDR, nextAlarmEpochTime);
+    EEPROM.commit();
+    // Clock.setA2Time(
+    //    alarmDay, alarmHour, alarmMinute,
+    //    alarmBits, a1dy, alarmH12, alarmPM);
+    // Clock.checkIfAlarm(2);
+    // // now it is safe to enable interrupt output
+    // Clock.turnOnAlarm(2);
 }
 
 void printMusicList(void)
