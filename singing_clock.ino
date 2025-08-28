@@ -7,8 +7,8 @@
 #include "Audio_MAX98357A.h"
 #include "SD.h"
 #include "driver/rtc_io.h"
-#include <EEPROM.h>
 #include <Update.h>
+#include <Preferences.h>
 
 #define FIRMWARE_VERSION 1.01
 
@@ -50,33 +50,35 @@ unsigned numberOfTracks;
 RTClib myRTC;
 DS3231 Clock;
 static int isSerialEnabled = -1;
+Preferences prefs;
 
 #define WAIT_FOR_SERIAL_FOR_S 2
-#define WAIT_FOR_SERIAL_SINGLE_TIME() do { if (isSerialEnabled == -1) { for (int i = 0; i < (WAIT_FOR_SERIAL_FOR_S * 10) && !Serial; ++i) delay(50); isSerialEnabled = !!Serial; } } while(0)
+#define WAIT_FOR_SERIAL_SINGLE_TIME() do { if (isSerialEnabled == -1) { for (int i = 0; i < (WAIT_FOR_SERIAL_FOR_S * 100) && !Serial; ++i) delay(20); if (!(isSerialEnabled = !!Serial)) Serial.end(); } } while(0)
 
 void setup() {
   btStop();                 // BT not needed
   WiFi.mode(WIFI_OFF);      // wifi not needed
   setCpuFrequencyMhz(80);   // slow down CPU for energy efficency
 
-  EEPROM.begin(9);  // single byte for checking daylight saving time
-                    // 8 bytes, next alarm time
-
   Wire.begin();
   Serial.begin(115200);
-
-  uint64_t nextAlarmTime;
-  EEPROM.get(NEXT_ALARM_TIME_ADDR, nextAlarmTime);
-  uint64_t now = myRTC.now().unixtime();
-
-  if (nextAlarmTime + 10ULL < now)
+  
+  if (!prefs.begin("app", false))
   {
-    // justSleep(nextAlarmTime - now);
-    // return;
+    LOG_PRINT("Failed to begin preferences");
+  }
+
+  uint64_t nextAlarmTime = prefs.getULong64("nat", UINT64_MAX);
+  uint64_t now = myRTC.now().unixtime();
+  if (now + 10ULL < nextAlarmTime)
+  {
+    firmwareUpdate();
+    setTime();
+    justSleep(nextAlarmTime - now);
+    return;
   }  // no need to sleep for less than 10 seconds, just do all the stuff
 
   LOG_PRINT("Woke-up at", now, "loaded alarm timestamp is", nextAlarmTime);
-
   pinMode(BFF_POWER_OFF, OUTPUT);
   digitalWrite(BFF_POWER_OFF, HIGH);
 
@@ -120,8 +122,6 @@ void setup() {
 
   playRandom();
 
-  LOG_PRINT("Program finished. Version", FIRMWARE_VERSION);
-  
   end();
 }
 
@@ -137,8 +137,9 @@ void justSleep(uint64_t seconds)
 
 void end()
 {
-  EEPROM.end();
   setNextAlarm();
+  LOG_PRINT("Program finished. Version", FIRMWARE_VERSION);
+  prefs.end();
   justSleep(SLEEP_LIMIT_SECONDS);
 }
 
@@ -188,7 +189,7 @@ void updateForDaylightTime()
   }
 
   bool isSummerTime = isSummerTimeNow();
-  uint8_t dstFlag = EEPROM.read(DST_FLAG_ADDR);
+  uint8_t dstFlag = prefs.getUChar("dst", 0);
   const uint8_t SUMMER_TIME_FLAG = 0xAB;
   const uint8_t WINTER_TIME_FLAG = 0xBC;
   if (dstFlag != SUMMER_TIME_FLAG && isSummerTime)
@@ -197,8 +198,7 @@ void updateForDaylightTime()
     uint64_t epoch_time = myRTC.now().unixtime() + int64_t(DAYLIGHT_SAVING_TIME_OFFSET) * 3600ull;
     Clock.setEpoch(epoch_time, false);
     Clock.setClockMode(false);
-    EEPROM.put(DST_FLAG_ADDR, SUMMER_TIME_FLAG);   // set daylight summer time flag 
-    EEPROM.commit();
+    prefs.putUChar("dst", SUMMER_TIME_FLAG);
     LOG_PRINT("Update to daylight summer time");
   }
   else if (dstFlag != WINTER_TIME_FLAG && !isSummerTime)
@@ -207,8 +207,7 @@ void updateForDaylightTime()
     uint64_t epoch_time = myRTC.now().unixtime() - int64_t(DAYLIGHT_SAVING_TIME_OFFSET) * 3600ull;
     Clock.setEpoch(epoch_time, false);
     Clock.setClockMode(false);
-    EEPROM.write(DST_FLAG_ADDR, WINTER_TIME_FLAG);   // set daylight summer time flag 
-    EEPROM.commit();
+    prefs.putUChar("dst", WINTER_TIME_FLAG);
     LOG_PRINT("Update to winter time");
   }
 }
@@ -385,9 +384,9 @@ void firmwareUpdate()
 void setTime()
 {
   DateTime datetime = myRTC.now();
-  LOG_PRINT("Unix time is", datetime.unixtime(), "\nCompilation time", __DATE_TIME_UNIX__);
   if (datetime.unixtime() < __DATE_TIME_UNIX__) // enter here on first startup or after battery replacing
   {
+    LOG_PRINT("Unix time is", datetime.unixtime(), "\nCompilation time", __DATE_TIME_UNIX__);
     Clock.setEpoch(__DATE_TIME_UNIX__, true);
     Clock.setClockMode(false);
   }
@@ -421,8 +420,7 @@ void setTime()
 
   LOG_PRINT("Epoch time updated : ", epoch_time);
 
-  EEPROM.write(DST_FLAG_ADDR, 0);   // set daylight summer time flag
-  EEPROM.commit();
+  prefs.putUChar("dst", 0);
 }
 
 byte calculateNextAlarmDate(byte alarmHour, byte alarmMinute)
@@ -506,8 +504,11 @@ void setNextAlarm()
 
     LOG_PRINT("Next epoch time to call", nextAlarmEpochTime);
 
-    EEPROM.put(NEXT_ALARM_TIME_ADDR, nextAlarmEpochTime);
-    EEPROM.commit();
+    size_t wr = prefs.putULong64("nat", nextAlarmEpochTime);
+    if (wr != sizeof(uint64_t))
+    {
+      LOG_PRINT("putULong64 saved", wr, "bajts (expeceted 8)");
+    }
     // Clock.setA2Time(
     //    alarmDay, alarmHour, alarmMinute,
     //    alarmBits, a1dy, alarmH12, alarmPM);
