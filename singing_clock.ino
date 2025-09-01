@@ -10,7 +10,7 @@
 #include <Update.h>
 #include <Preferences.h>
 
-#define FIRMWARE_VERSION 1.01
+#define FIRMWARE_VERSION 1.02
 
 // Adafruit Audio BFF pinout taken from
 // https://learn.adafruit.com/adafruit-audio-bff/pinouts
@@ -18,10 +18,9 @@
 #define APLIFIER_LRCLK A2
 #define APLIFIER_DATA A1
 #define SD_CHIP_SELECT_DATA A0
-#define RTC_INT_GPIO GPIO_NUM_1
 #define BFF_POWER_OFF GPIO_NUM_44
 
-#define SLEEP_LIMIT_SECONDS 360ULL
+#define SLEEP_LIMIT_SECONDS 300ULL
 #define DST_FLAG_ADDR 0
 #define NEXT_ALARM_TIME_ADDR 1
 
@@ -70,7 +69,7 @@ void setup() {
 
   uint64_t nextAlarmTime = prefs.getULong64("nat", UINT64_MAX);
   uint64_t now = myRTC.now().unixtime();
-  if (now + 10ULL < nextAlarmTime)
+  if (now < nextAlarmTime)
   {
     firmwareUpdate();
     setTime();
@@ -145,8 +144,6 @@ void end()
 
 void turnOffTheAlarm()
 {
-    // rtc_gpio_deinit(RTC_INT_GPIO);  // deinit to use A0 as CS gpio
-
     Clock.enable32kHz(false);
 
     // turn off the alarms
@@ -334,23 +331,16 @@ void LOG_PRINT(Args&&... args)
         printLog(std::forward<Args>(args)...);
 }
 
-void saveLog(byte alarmDay, byte alarmHour, byte alarmMinute)
+void saveLog(DateTime now, DateTime nextAlarm)
 {
   const char* MONTH_ARR[] = {"<err>", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
   FILE* fp = fopen("/sd/log.txt", "a");
   if (!fp)
     return;
 
-  bool century;
-  DateTime datetime = myRTC.now();
-  const uint64_t epochTime = datetime.unixtime();
-  byte currentMonth = Clock.getMonth(century);
-  byte currentDate = Clock.getDate();
-  byte nextMonth = currentDate > alarmDay ? (currentMonth % 12 + 1) : currentMonth;
-  if (fprintf(fp, "Called at %llu (%u %s %02u:%02u), next alarm at %u %s %02u:%02u\n",
-    (unsigned long long)epochTime,
-    currentDate, MONTH_ARR[currentMonth], datetime.hour(), datetime.minute(),
-    alarmDay, MONTH_ARR[nextMonth], alarmHour, alarmMinute) < 0)
+  if (fprintf(fp, "Called at %llu (%u %s %02u:%02u), next alarm at %llu (%u %s %02u:%02u)\n",
+      now.unixtime(), now.day(), MONTH_ARR[now.month()], now.hour(), now.minute(),
+      nextAlarm.unixtime(), nextAlarm.day(), MONTH_ARR[nextAlarm.month()], nextAlarm.hour(), nextAlarm.minute()) < 0)
   {
       Serial.println("Failed to save timestamp in log.txt");  // only serial here
   }
@@ -423,40 +413,13 @@ void setTime()
   prefs.putUChar("dst", 0);
 }
 
-byte calculateNextAlarmDate(byte alarmHour, byte alarmMinute)
+byte calculateNextAlarmDate()
 {
-    // calculate in month days
-    static const byte daysInMonth[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
-    bool century;
-    int  year   = Clock.getYear() + 2000;
-    byte month = Clock.getMonth(century);
-    byte dim = daysInMonth[month];
-    byte addDays;
-    DAYS_AHEAD_MIN = clamp(DAYS_AHEAD_MIN, 0, 28);
-    DAYS_AHEAD_MAX = clamp(DAYS_AHEAD_MAX, 0, 28);
-    if (DAYS_AHEAD_MIN > DAYS_AHEAD_MAX)
-      return Clock.getDate();
-    if (DAYS_AHEAD_MIN == DAYS_AHEAD_MAX)
-      addDays = DAYS_AHEAD_MIN;
-    else
-      addDays = (esp_random() % (DAYS_AHEAD_MAX - DAYS_AHEAD_MIN + 1)) + DAYS_AHEAD_MIN;
-    if (addDays == 0)
-    {
-      DateTime datetime = myRTC.now();
-      if (datetime.hour() > alarmHour ||
-          (datetime.hour() == alarmHour && (datetime.minute() + (SLEEP_LIMIT_SECONDS / 60)) >= alarmMinute))
-      {
-        // If a date and time from the past was drawn, add a single day 
-        addDays = 1;
-      }
-    }
-    byte newDate = Clock.getDate() + addDays;
-    if (month == 2 && ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0))) {
-      dim = 29;
-    }
-    if (newDate > dim)
-      newDate -= dim;
-    return newDate;
+    DAYS_AHEAD_MIN = clamp(DAYS_AHEAD_MIN, 0, 365);
+    DAYS_AHEAD_MAX = clamp(DAYS_AHEAD_MAX, 0, 365);
+    if (DAYS_AHEAD_MAX >= DAYS_AHEAD_MIN)
+      return DAYS_AHEAD_MIN;
+    return (esp_random() % (DAYS_AHEAD_MAX - DAYS_AHEAD_MIN + 1)) + DAYS_AHEAD_MIN;
 }
 
 byte calculateNextAlarmHour()
@@ -479,42 +442,41 @@ byte calculateNextAlarmMinute()
 
 void setNextAlarm()
 {
-    // Format: .setA*Time(DoW|Date, Hour, Minute, Second, 0x0, DoW|Date, 12h|24h, am|pm)
-    //                    |                                    |         |        |
-    //                    |                                    |         |        +--> when set for 12h time, true for pm, false for am
-    //                    |                                    |         +--> true if setting time based on 12 hour, false if based on 24 hour
-    //                    |                                    +--> true if you're setting DoW, false for absolute date
-    //                    +--> INTEGER representing day of the week, 1 to 7 (Monday to Sunday)
-    //
     const unsigned MINUTES_IN_HOUR = 60;
     bool alarmH12 = false;
     bool alarmPM = false;
     byte alarmHour = calculateNextAlarmHour();
     byte alarmMinute = calculateNextAlarmMinute();
-    byte alarmDay = calculateNextAlarmDate(alarmHour, alarmMinute);
+    byte alarmDayAdd = calculateNextAlarmDate();
     byte alarmBits = 0b00000000; // alarm when DoM, hour, minute match
     byte a1dy = false; // true makes the alarm go on A1Day = Day of Week, false - Day of Month
 
-    saveLog(alarmDay, alarmHour, alarmMinute);
-
     DateTime datetime = myRTC.now();
-    DateTime nextAlarm = DateTime(datetime.year(), datetime.month(), alarmDay,
-                                  alarmHour, alarmMinute, 0);
-    uint64_t nextAlarmEpochTime = nextAlarm.unixtime();
+    if (alarmDayAdd == 0)
+    {
+      if (datetime.hour() > alarmHour ||
+         (datetime.hour() == alarmHour && (datetime.minute() + (SLEEP_LIMIT_SECONDS / 60)) >= alarmMinute))
+      {
+        // If a date and time from the past was drawn, add a single day 
+        alarmDayAdd = 1;
+      }
+    }
 
-    LOG_PRINT("Next epoch time to call", nextAlarmEpochTime);
+    const uint64_t timeAtMidnightToday = datetime.unixtime() - (uint64_t(datetime.hour()) * 3600ULL)
+                                                             - (uint64_t(datetime.minute()) * 60ULL)
+                                                             - (uint64_t(datetime.second()));
+    const uint64_t nextAlarmEpochTime = timeAtMidnightToday + (uint64_t(alarmDayAdd) * 86400ULL)
+                                                            + (uint64_t(alarmHour) * 3600ULL)
+                                                            + (uint64_t(alarmMinute) * 60ULL);
+    DateTime nextAlarm = DateTime(nextAlarmEpochTime);
+  
+    saveLog(datetime, nextAlarm);
 
     size_t wr = prefs.putULong64("nat", nextAlarmEpochTime);
     if (wr != sizeof(uint64_t))
     {
       LOG_PRINT("putULong64 saved", wr, "bajts (expeceted 8)");
     }
-    // Clock.setA2Time(
-    //    alarmDay, alarmHour, alarmMinute,
-    //    alarmBits, a1dy, alarmH12, alarmPM);
-    // Clock.checkIfAlarm(2);
-    // // now it is safe to enable interrupt output
-    // Clock.turnOnAlarm(2);
 }
 
 void printMusicList(void)

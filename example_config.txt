@@ -7,10 +7,10 @@
 # 	     every line starts with # is a comment line.	      #
 # ################################################################### #
 
-# day will be random but not earlier than DAYS_AHEAD_MIN days 
+# day will be random but not earlier than DAYS_AHEAD_MIN days <0, 365>
 DAYS_AHEAD_MIN=1
 
-# day will be random but not later than DAYS_AHEAD_MAX days 
+# day will be random but not later than DAYS_AHEAD_MAX days <0, 365>
 DAYS_AHEAD_MAX=3
 
 # hour will be random but no earlier than at SINCE_HOUR (24 hours clock)
