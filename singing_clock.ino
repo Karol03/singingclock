@@ -1,5 +1,9 @@
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <inttypes.h>
 
 #include <WiFi.h>
 #include <Wire.h>
@@ -10,7 +14,7 @@
 #include <Update.h>
 #include <Preferences.h>
 
-#define FIRMWARE_VERSION 1.02
+#define FIRMWARE_VERSION 1.03
 
 // Adafruit Audio BFF pinout taken from
 // https://learn.adafruit.com/adafruit-audio-bff/pinouts
@@ -21,12 +25,11 @@
 #define BFF_POWER_OFF GPIO_NUM_44
 
 #define SLEEP_LIMIT_SECONDS 300ULL
-#define DST_FLAG_ADDR 0
 #define NEXT_ALARM_TIME_ADDR 1
 
 #define clamp(value, min, max) ((value) < (min) ? (min) : ((value) > (max) ? (max) : (value)))
 
-#define PARSE_VARIABLE(name) if (strcmp(key, #name) == 0) { name = atoi(value); buffor += "Changed default value of '"#name"' to "; buffor += value; buffor += '\n';}
+#define PARSE_VARIABLE(name) if (strcmp(key, #name) == 0) { name = atoi(value); buffer += "Changed default value of '"#name"' to "; buffer += value; buffer += '\n';}
 
 
 static unsigned DAYS_AHEAD_MIN = 1u;
@@ -36,11 +39,7 @@ static unsigned UNTIL_HOUR = 20u;
 static unsigned SINCE_MIN = 0u;
 static unsigned UNTIL_MIN = 59u;
 static int UTC_OFFSET = 0;
-static unsigned ENABLE_DAYLIGHT_SAVING_TIME = 0;
-static int DAYLIGHT_SAVING_TIME_OFFSET = 0;
-static unsigned SUMMER_TIME_START_MONTH = 0u;
-static unsigned SUMMER_TIME_END_MONTH = 0u;
-static unsigned VOLUME = 4;
+static unsigned VOLUME = 2;
 
 
 Audio_MAX98357A amplifier;
@@ -48,61 +47,88 @@ String musicList[100];
 unsigned numberOfTracks;
 RTClib myRTC;
 DS3231 Clock;
-static int isSerialEnabled = -1;
+static int isSerialEnabled = (1 << 2) | (1 << 0);
 Preferences prefs;
 
 #define WAIT_FOR_SERIAL_FOR_S 2
-#define WAIT_FOR_SERIAL_SINGLE_TIME() do { if (isSerialEnabled == -1) { for (int i = 0; i < (WAIT_FOR_SERIAL_FOR_S * 100) && !Serial; ++i) delay(20); if (!(isSerialEnabled = !!Serial)) Serial.end(); } } while(0)
+#define WAIT_FOR_SERIAL_SINGLE_TIME() \
+  do { \
+    if (isSerialEnabled & (1 << 0)) { \
+      for (int i = 0; i < (WAIT_FOR_SERIAL_FOR_S * 100) && !Serial; ++i) \
+        delay(10); \
+      if (Serial) \
+      { \
+        isSerialEnabled &= ~(1 << 0); \
+        isSerialEnabled |= (1 << 1); \
+      } \
+      else \
+      { \
+        isSerialEnabled &= ~(1 << 0); \
+        Serial.end(); \
+      } \
+    } \
+  } while(0)
+
+template <typename... Args>
+void LOG_PRINT(Args&&... args)
+{
+    WAIT_FOR_SERIAL_SINGLE_TIME();
+    if (isSerialEnabled & (1 << 1))
+        printSerial(std::forward<Args>(args)...);
+    if (isSerialEnabled & (1 << 2))
+        printLog(std::forward<Args>(args)...);
+}
 
 void setup() {
   btStop();                 // BT not needed
   WiFi.mode(WIFI_OFF);      // wifi not needed
   setCpuFrequencyMhz(80);   // slow down CPU for energy efficency
 
-  Wire.begin();
+  pinMode(BFF_POWER_OFF, OUTPUT);  
+  digitalWrite(BFF_POWER_OFF, HIGH);    // enable RTC/amplifier and SDcard
+
   Serial.begin(115200);
-  
+
   if (!prefs.begin("app", false))
   {
     LOG_PRINT("Failed to begin preferences");
   }
 
-  uint64_t nextAlarmTime = prefs.getULong64("nat", UINT64_MAX);
-  uint64_t now = myRTC.now().unixtime();
-  if (now < nextAlarmTime)
-  {
-    firmwareUpdate();
-    setTime();
-    justSleep(nextAlarmTime - now);
-    return;
-  }  // no need to sleep for less than 10 seconds, just do all the stuff
+  delay(20);
+  Wire.begin();  // for RTC
 
-  LOG_PRINT("Woke-up at", now, "loaded alarm timestamp is", nextAlarmTime);
-  pinMode(BFF_POWER_OFF, OUTPUT);
-  digitalWrite(BFF_POWER_OFF, HIGH);
+  if (!amplifier.initSDCard(/*csPin=*/SD_CHIP_SELECT_DATA))
+  {
+    Serial.println("Initialize SD card failed !"); // if SD init failed only console available
+    isSerialEnabled &= ~(1 << 2);
+  }
+
+  esp_reset_reason_t rr = esp_reset_reason();
+  if (rr != ESP_RST_EXT /* reset button pressed */ && rr != ESP_RST_POWERON /* battery replacement */)
+  {
+    // check if alarm should fire
+    uint64_t nextAlarmTime = prefs.getULong64("nat", 0llu);
+    uint64_t nowUTC = myRTC.now().unixtime();
+    if (nowUTC < nextAlarmTime)
+    {
+      // alarm should not fire yet
+      firmwareUpdate();
+      setTime();
+      justSleep(nextAlarmTime - nowUTC);
+      return;
+    }
+    LOG_PRINT("Woke up at UTC time: ", nowUTC, "alarm at:", nextAlarmTime);
+  }
+  else
+  {
+    LOG_PRINT("Reset/battery replacement alarm fire");
+  }
 
   turnOffTheAlarm();
 
-  int i = 0;
-  while (!amplifier.initI2S(/*_bclk=*/APLIFIER_BCLK, /*_lrclk=*/APLIFIER_LRCLK, /*_din=*/APLIFIER_DATA))
+  if (!amplifier.initI2S(/*_bclk=*/APLIFIER_BCLK, /*_lrclk=*/APLIFIER_LRCLK, /*_din=*/APLIFIER_DATA))
   {
-    Serial.println("Initialize I2S failed !"); // only console, as sd card not available
-    if (i > 10)
-    {
-      end();
-    }
-    ++i;
-  }
-  
-  i = 0;
-  while (!amplifier.initSDCard(/*csPin=*/SD_CHIP_SELECT_DATA))
-  {
-    LOG_PRINT("Initialize SD card failed !");
-    if (i > 10)
-    {
-      end();
-    }
-    ++i;
+    LOG_PRINT("Initialize I2S failed!");
   }
 
   firmwareUpdate();
@@ -110,8 +136,6 @@ void setup() {
   setTime();
 
   loadConfig();
-
-  updateForDaylightTime();  // must be called after loadConfig to first load required variables from file
 
   amplifier.scanSDMusic(musicList);
   printMusicList();
@@ -129,6 +153,7 @@ void loop() {
 
 void justSleep(uint64_t seconds)
 {
+  digitalWrite(BFF_POWER_OFF, LOW);
   seconds = clamp(seconds, 1ULL, SLEEP_LIMIT_SECONDS);
   esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
   esp_deep_sleep_start();
@@ -167,63 +192,22 @@ void trim(char* str)
     *(end + 1) = '\0';
 }
 
-bool isSummerTimeNow()
-{
-  bool century;
-  byte month = Clock.getMonth(century);
-  if (SUMMER_TIME_START_MONTH < SUMMER_TIME_END_MONTH)
-  {
-    return (SUMMER_TIME_START_MONTH <= month && month <= SUMMER_TIME_END_MONTH);
-  }
-  return (month <= SUMMER_TIME_START_MONTH || SUMMER_TIME_END_MONTH <= month);
-}
-
-void updateForDaylightTime()
-{
-  if (!ENABLE_DAYLIGHT_SAVING_TIME || DAYLIGHT_SAVING_TIME_OFFSET == 0)
-  {
-    return;
-  }
-
-  bool isSummerTime = isSummerTimeNow();
-  uint8_t dstFlag = prefs.getUChar("dst", 0);
-  const uint8_t SUMMER_TIME_FLAG = 0xAB;
-  const uint8_t WINTER_TIME_FLAG = 0xBC;
-  if (dstFlag != SUMMER_TIME_FLAG && isSummerTime)
-  {
-    // set summer time
-    uint64_t epoch_time = myRTC.now().unixtime() + int64_t(DAYLIGHT_SAVING_TIME_OFFSET) * 3600ull;
-    Clock.setEpoch(epoch_time, false);
-    Clock.setClockMode(false);
-    prefs.putUChar("dst", SUMMER_TIME_FLAG);
-    LOG_PRINT("Update to daylight summer time");
-  }
-  else if (dstFlag != WINTER_TIME_FLAG && !isSummerTime)
-  {
-    // set winter time
-    uint64_t epoch_time = myRTC.now().unixtime() - int64_t(DAYLIGHT_SAVING_TIME_OFFSET) * 3600ull;
-    Clock.setEpoch(epoch_time, false);
-    Clock.setClockMode(false);
-    prefs.putUChar("dst", WINTER_TIME_FLAG);
-    LOG_PRINT("Update to winter time");
-  }
-}
-
 void loadConfig()
 {
-    FILE* file = fopen("/sd/config.txt", "r");
+    File file = SD.open("/config.txt", FILE_READ);
     if (!file)
     {
         LOG_PRINT("Failed to open config file, use default values");
         return;
     }
 
-    String buffor;
+    String buffer;
     char line[512];
     unsigned count = 0;
 
-    while (fgets(line, sizeof(line), file))
+    while ((count = file.readBytesUntil('\n', line, sizeof(line))))
     {
+        line[count] = '\0';
         if (line[0] == '#' || line[0] == '\n') // skip comments and blank lines
             continue;
 
@@ -245,14 +229,10 @@ void loadConfig()
         else PARSE_VARIABLE(UNTIL_MIN)
         else PARSE_VARIABLE(VOLUME)
         else PARSE_VARIABLE(UTC_OFFSET)
-        else PARSE_VARIABLE(ENABLE_DAYLIGHT_SAVING_TIME)
-        else PARSE_VARIABLE(DAYLIGHT_SAVING_TIME_OFFSET)
-        else PARSE_VARIABLE(SUMMER_TIME_START_MONTH)
-        else PARSE_VARIABLE(SUMMER_TIME_END_MONTH)
     }
 
-    fclose(file);
-    LOG_PRINT(buffor.c_str(), "\nConfig loaded from file");
+    file.close();
+    LOG_PRINT(buffer.c_str(), "\nConfig loaded from file");
 }
 
 void playRandom()
@@ -310,41 +290,32 @@ inline String singleLogPrint(int64_t v)  { return i64ToStr(v); }
 template <typename... Args>
 void printLog(Args&&... args)
 {
-  FILE* fp = fopen("/sd/log.txt", "a");
+  File fp = SD.open("/log.txt", FILE_APPEND);
   if (!fp) return;
 
   const char* sep = "";
-  ( (fprintf(fp, "%s", sep),
-     fprintf(fp, "%s", singleLogPrint(std::forward<Args>(args)).c_str()),
-     sep = " "), ... );
-  fprintf(fp, "\n");
-  fclose(fp);
+  ((fp.print(sep), fp.print(singleLogPrint(std::forward<Args>(args))), sep = " "), ...);
+  fp.print('\n');
+  fp.close();
 }
 
-template <typename... Args>
-void LOG_PRINT(Args&&... args)
+void saveLog(const DateTime& now, const DateTime& nextAlarm)
 {
-    WAIT_FOR_SERIAL_SINGLE_TIME();
-    if (Serial)
-        printSerial(std::forward<Args>(args)...);
-    else
-        printLog(std::forward<Args>(args)...);
-}
-
-void saveLog(DateTime now, DateTime nextAlarm)
-{
+  char buffer[128];
   const char* MONTH_ARR[] = {"<err>", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-  FILE* fp = fopen("/sd/log.txt", "a");
-  if (!fp)
-    return;
+  int len = snprintf(buffer, sizeof(buffer),
+           "Called at %llu (%02u %s %02u:%02u), next alarm at %llu (%02u %s %02u:%02u)\n",
+            (unsigned long long)now.unixtime(),
+            now.day(), MONTH_ARR[now.month()],
+            now.hour(), now.minute(),
+            (unsigned long long)nextAlarm.unixtime(),
+            nextAlarm.day(), MONTH_ARR[nextAlarm.month()],
+            nextAlarm.hour(), nextAlarm.minute());
 
-  if (fprintf(fp, "Called at %llu (%u %s %02u:%02u), next alarm at %llu (%u %s %02u:%02u)\n",
-      now.unixtime(), now.day(), MONTH_ARR[now.month()], now.hour(), now.minute(),
-      nextAlarm.unixtime(), nextAlarm.day(), MONTH_ARR[nextAlarm.month()], nextAlarm.hour(), nextAlarm.minute()) < 0)
-  {
-      Serial.println("Failed to save timestamp in log.txt");  // only serial here
-  }
-  fclose(fp);
+  if (len < 0) return;
+  if (len >= (int)sizeof(buffer)) len = sizeof(buffer) - 1;
+  buffer[len] = '\0';
+  LOG_PRINT(buffer);
 }
 
 void firmwareUpdate()
@@ -352,8 +323,7 @@ void firmwareUpdate()
   File firmware =  SD.open("/firmware.bin");
   if (firmware) 
   {
-      LOG_PRINT("Updating the firmware...");
-      Update.begin(firmware.size(), U_FLASH);
+      Update.begin(firmware.size());
       Update.writeStream(firmware);
       if (Update.end())
       {
@@ -370,113 +340,171 @@ void firmwareUpdate()
       }
   }
 }
+// 0=Nd,1=Pn,...,6=So Sakamoto
+static int dow_0Sun(int y, int m, int d) {
+  static int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+  if (m < 3) y -= 1;
+  return (y + y/4 - y/100 + y/400 + t[m-1] + d) % 7;
+}
 
-void setTime()
-{
-  DateTime datetime = myRTC.now();
-  if (datetime.unixtime() < __DATE_TIME_UNIX__) // enter here on first startup or after battery replacing
-  {
-    LOG_PRINT("Unix time is", datetime.unixtime(), "\nCompilation time", __DATE_TIME_UNIX__);
-    Clock.setEpoch(__DATE_TIME_UNIX__, true);
-    Clock.setClockMode(false);
-  }
+static int daysInMonth(int y, int m) {
+  static const int dm[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+  if (m != 2) return dm[m];
+  bool leap = ( (y%4==0 && y%100!=0) || (y%400==0) );
+  return leap ? 29 : 28;
+}
 
-  FILE* fp = fopen("/sd/timestamp.txt", "r");
+static int lastSundayDay(int y, int m) {
+  int last = daysInMonth(y, m);
+  int w = dow_0Sun(y, m, last); // 0=Nd
+  return last - w;
+}
+
+static bool isDST_Europe_UTC(uint64_t utc_epoch) {
+  DateTime t(utc_epoch);
+  int y = t.year();
+
+  DateTime startUTC(y, 3, lastSundayDay(y,3), 1, 0, 0);  // Mar, 01:00 UTC
+  DateTime endUTC  (y,10, lastSundayDay(y,10),1, 0, 0);  // Oct, 01:00 UTC
+
+  return (utc_epoch >= startUTC.unixtime() && utc_epoch < endUTC.unixtime());
+}
+
+static int64_t localOffsetSeconds(uint64_t utc_epoch) {
+  int64_t off = UTC_OFFSET * 3600;
+  if (isDST_Europe_UTC(utc_epoch))
+    off += 3600;    // +1 hour
+  return off;
+}
+
+static uint64_t utcToLocal(uint64_t utc_epoch) {
+  return utc_epoch + localOffsetSeconds(utc_epoch);
+}
+
+static uint64_t localToUtc(uint64_t local_epoch) {
+  return local_epoch - localOffsetSeconds(local_epoch);
+}
+
+void setTime() {
+  File fp = SD.open("/timestamp.txt", FILE_READ);
   if (!fp)
     return;
 
-  uint64_t epoch_time;
-  bool isLoaded = (fscanf(fp, "%" SCNu64, &epoch_time) == 1);
-  fclose(fp);
-
-  LOG_PRINT("Found new timestamp");
-  if (!isLoaded)
+  char buf[32] = {0};
+  size_t n = fp.readBytesUntil('\n', buf, sizeof(buf)-1);
+  fp.close();
+  if (n == 0)
   {
     LOG_PRINT("Failed to read number from timestamp file");
     return;
   }
-  
+
+  uint64_t epoch_utc = strtoull(buf, nullptr, 10);
+  LOG_PRINT("Found new timestamp");
+
   if (!SD.remove("/timestamp.txt"))
   {
-      LOG_PRINT("Failed to remove timestamp file");
-      return;
+    LOG_PRINT("Failed to remove timestamp file");
+    return;
   }
 
-  UTC_OFFSET = clamp(UTC_OFFSET, -12, 12);
-  epoch_time += UTC_OFFSET * 3600;
-
-  Clock.setEpoch(epoch_time, false);
+  Clock.setEpoch(epoch_utc, true);
   Clock.setClockMode(false);
 
-  LOG_PRINT("Epoch time updated : ", epoch_time);
-
-  prefs.putUChar("dst", 0);
+  LOG_PRINT("Epoch time updated : ", epoch_utc);
 }
 
-byte calculateNextAlarmDate()
+uint16_t randInRange(uint16_t lo, uint16_t hi)
 {
-    DAYS_AHEAD_MIN = clamp(DAYS_AHEAD_MIN, 0, 365);
-    DAYS_AHEAD_MAX = clamp(DAYS_AHEAD_MAX, 0, 365);
-    if (DAYS_AHEAD_MAX >= DAYS_AHEAD_MIN)
-      return DAYS_AHEAD_MIN;
-    return (esp_random() % (DAYS_AHEAD_MAX - DAYS_AHEAD_MIN + 1)) + DAYS_AHEAD_MIN;
+  if (hi <= lo)
+    return lo;
+  uint32_t span = uint32_t(hi - lo + 1);
+  return lo + (esp_random() % span);
+}
+
+uint16_t calculateNextAlarmDate()
+{
+  DAYS_AHEAD_MIN = clamp(DAYS_AHEAD_MIN, 0u, 365u);
+  DAYS_AHEAD_MAX = clamp(DAYS_AHEAD_MAX, 0u, 365u);
+  return randInRange(DAYS_AHEAD_MIN, DAYS_AHEAD_MAX);
 }
 
 byte calculateNextAlarmHour()
 {
-    SINCE_HOUR = clamp(SINCE_HOUR, 0, 23);
-    UNTIL_HOUR = clamp(UNTIL_HOUR, 0, 23);
-    if (SINCE_HOUR >= UNTIL_HOUR)
-      return SINCE_HOUR;
-    return (esp_random() % (UNTIL_HOUR - SINCE_HOUR + 1)) + SINCE_HOUR;
+  SINCE_HOUR = clamp(SINCE_HOUR, 0u, 23u);
+  UNTIL_HOUR = clamp(UNTIL_HOUR, 0u, 23u);
+  if (SINCE_HOUR == UNTIL_HOUR)
+    return SINCE_HOUR;
+  if (SINCE_HOUR < UNTIL_HOUR)
+  {
+    return (byte)randInRange(SINCE_HOUR, UNTIL_HOUR);
+  }
+  else
+  {
+    // [SINCE..23] ∪ [0..UNTIL]
+    uint8_t span = (24 - SINCE_HOUR) + (UNTIL_HOUR + 1);
+    uint8_t r = esp_random() % span;
+    return (r < (24 - SINCE_HOUR)) ? (SINCE_HOUR + r) : (r - (24 - SINCE_HOUR));
+  }
 }
 
 byte calculateNextAlarmMinute()
 {
-    SINCE_MIN = clamp(SINCE_MIN, 0, 59);
-    UNTIL_MIN = clamp(UNTIL_MIN, 0, 59);
-    if (SINCE_MIN >= UNTIL_MIN)
-      return SINCE_MIN;
-    return (esp_random() % (UNTIL_MIN - SINCE_MIN + 1)) + SINCE_MIN;
+  SINCE_MIN = clamp(SINCE_MIN, 0u, 59u);
+  UNTIL_MIN = clamp(UNTIL_MIN, 0u, 59u);
+  if (SINCE_MIN == UNTIL_MIN)
+    return SINCE_MIN;
+  if (SINCE_MIN < UNTIL_MIN)
+  {
+    return (byte)randInRange(SINCE_MIN, UNTIL_MIN);
+  }
+  else
+  {
+    // [SINCE..23] ∪ [0..UNTIL]
+    uint8_t span = (24 - SINCE_MIN) + (UNTIL_MIN + 1);
+    uint8_t r = esp_random() % span;
+    return (r < (24 - SINCE_MIN)) ? (SINCE_MIN + r) : (r - (24 - SINCE_MIN));
+  }
 }
 
 void setNextAlarm()
 {
-    const unsigned MINUTES_IN_HOUR = 60;
-    bool alarmH12 = false;
-    bool alarmPM = false;
-    byte alarmHour = calculateNextAlarmHour();
-    byte alarmMinute = calculateNextAlarmMinute();
-    byte alarmDayAdd = calculateNextAlarmDate();
-    byte alarmBits = 0b00000000; // alarm when DoM, hour, minute match
-    byte a1dy = false; // true makes the alarm go on A1Day = Day of Week, false - Day of Month
+  uint64_t nowUTC = myRTC.now().unixtime();
+  if (nowUTC == 0ull)
+  {
+    LOG_PRINT("Failed to read UTC time, cannot set the next alarm.");
+    return;
+  }
+  uint64_t nowLocal = utcToLocal(nowUTC);
 
-    DateTime datetime = myRTC.now();
-    if (alarmDayAdd == 0)
-    {
-      if (datetime.hour() > alarmHour ||
-         (datetime.hour() == alarmHour && (datetime.minute() + (SLEEP_LIMIT_SECONDS / 60)) >= alarmMinute))
-      {
-        // If a date and time from the past was drawn, add a single day 
-        alarmDayAdd = 1;
-      }
-    }
+  DateTime nl(nowLocal);
+  uint64_t midnightLocal = nowLocal
+                         - nl.hour() * 3600llu
+                         - nl.minute() * 60llu
+                         - nl.second();
 
-    const uint64_t timeAtMidnightToday = datetime.unixtime() - (uint64_t(datetime.hour()) * 3600ULL)
-                                                             - (uint64_t(datetime.minute()) * 60ULL)
-                                                             - (uint64_t(datetime.second()));
-    const uint64_t nextAlarmEpochTime = timeAtMidnightToday + (uint64_t(alarmDayAdd) * 86400ULL)
-                                                            + (uint64_t(alarmHour) * 3600ULL)
-                                                            + (uint64_t(alarmMinute) * 60ULL);
-    DateTime nextAlarm = DateTime(nextAlarmEpochTime);
-  
-    saveLog(datetime, nextAlarm);
+  uint16_t dayAdd = calculateNextAlarmDate();
+  byte hour = calculateNextAlarmHour();
+  byte minute = calculateNextAlarmMinute();
 
-    size_t wr = prefs.putULong64("nat", nextAlarmEpochTime);
-    if (wr != sizeof(uint64_t))
-    {
-      LOG_PRINT("putULong64 saved", wr, "bajts (expeceted 8)");
-    }
+  uint64_t targetLocal = midnightLocal
+                       + (uint64_t)dayAdd * 86400u
+                       + (uint64_t)hour * 3600u
+                       + (uint64_t)minute * 60u;
+
+  if (dayAdd == 0 && targetLocal - SLEEP_LIMIT_SECONDS <= nowLocal)
+  {
+    targetLocal += 86400ull;
+  }
+
+  uint64_t targetUTC = localToUtc(targetLocal);
+  saveLog(DateTime(nowLocal), DateTime(targetLocal));
+
+  size_t wr = prefs.putULong64("nat", (uint64_t)targetUTC);
+  if (wr != sizeof(uint64_t))
+  {
+    LOG_PRINT("putULong64 saved", wr, "bytes (expected 8)");
+  }
 }
 
 void printMusicList(void)

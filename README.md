@@ -20,6 +20,8 @@ The device plays one random WAV file at a random time within the specified range
 
 The ranges are configurable in `config.txt`. The time is based on DS3231 with optional daylight saving time (DST) correction set in the configuration file.
 
+The current consumption measured by the Profiler was 80mA (during operation) and 80uA (during sleep) for a voltage of 4.5V connected to the VBat input, and 70mA (during operation) and 30uA (during sleep) for a voltage of 3.6V connected to the VBat input. Therefore, simple calculations indicate that when powering the device with batteries (3xAA, typically 2200mAh capacity) and running it sporadically once a day, the power supply should be sufficient for >= 2 years of operation. This result can be improved by increasing the capacity of the batteries used, stabilizing the VBat voltage at ~3.7V, or by running the device less frequently.
+
 ## Hardware
 - MCU: Seeed XIAO ESP32S3
 - Audio/SD: Adafruit 5769 SD card amplifier module (SD card formatted in FAT32 system)
