@@ -237,6 +237,7 @@ class DS3231 {
 
 		byte readControlByte(bool which);
 			// Read selected control byte: (0); reads 0x0e, (1) reads 0x0f
+		void clearOSF();
 	private:
 
 		static uint8_t dowToDS3231(uint8_t d) { return d == 0 ? 7 : d; }

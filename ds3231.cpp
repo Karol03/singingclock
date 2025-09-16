@@ -194,6 +194,20 @@ DateTime RTClib::now(TwoWire & _Wire) {
   return DateTime (y, m, d, hh, mm, ss);
 }
 
+void DS3231::clearOSF()
+{
+  Wire.beginTransmission(0x68);
+	Wire.write(0x0F);
+	Wire.endTransmission();
+  Wire.requestFrom(0x68, 1);
+	uint8_t s = Wire.read();
+	s &= ~0x80;
+  Wire.beginTransmission(0x68);
+	Wire.write(0x0F);
+	Wire.write(s);
+	Wire.endTransmission();
+}
+
 // simple func to adjust the time of DS3231
 void DS3231::adjust(const DateTime& dt)
 {

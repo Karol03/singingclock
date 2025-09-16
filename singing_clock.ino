@@ -14,7 +14,7 @@
 #include <Update.h>
 #include <Preferences.h>
 
-#define FIRMWARE_VERSION 1.03
+#define FIRMWARE_VERSION 1.04
 
 // Adafruit Audio BFF pinout taken from
 // https://learn.adafruit.com/adafruit-audio-bff/pinouts
@@ -102,6 +102,7 @@ void setup() {
     Serial.println("Initialize SD card failed !"); // if SD init failed only console available
     isSerialEnabled &= ~(1 << 2);
   }
+  ensureUtf8Log();
 
   esp_reset_reason_t rr = esp_reset_reason();
   if (rr != ESP_RST_EXT /* reset button pressed */ && rr != ESP_RST_POWERON /* battery replacement */)
@@ -287,6 +288,34 @@ inline String singleLogPrint(T&& x) { return String(std::forward<T>(x)); }
 inline String singleLogPrint(uint64_t v) { return u64ToStr(v); }
 inline String singleLogPrint(int64_t v)  { return i64ToStr(v); }
 
+void ensureUtf8Log()
+{
+  if (!SD.exists("/log.txt"))
+  {
+    File f = SD.open("/log.txt", FILE_WRITE);
+    if (f) {
+      const uint8_t bom[3] = {0xEF, 0xBB, 0xBF};
+      f.write(bom, 3);
+      f.close();
+    }
+  }
+  else
+  {
+    File f = SD.open("/log.txt", FILE_READ);
+    if (f) {
+      uint8_t head[2] = {0,0};
+      f.read(head, 2);
+      f.close();
+      if ((head[0]==0xFF && head[1]==0xFE) || (head[0]==0xFE && head[1]==0xFF))
+      {
+        SD.remove("/log.txt"); // UTF-16 -> remove and create UTF-8
+        File nf = SD.open("/log.txt", FILE_WRITE);
+        if (nf) nf.close();
+      }
+    }
+  }
+}
+
 template <typename... Args>
 void printLog(Args&&... args)
 {
@@ -382,7 +411,14 @@ static uint64_t utcToLocal(uint64_t utc_epoch) {
 }
 
 static uint64_t localToUtc(uint64_t local_epoch) {
-  return local_epoch - localOffsetSeconds(local_epoch);
+  int64_t guess_utc = (int64_t)local_epoch - localOffsetSeconds((uint64_t)local_epoch);
+  for (int i = 0; i < 2; ++i) {
+    int64_t off = localOffsetSeconds((uint64_t)guess_utc);
+    int64_t new_guess = (int64_t)local_epoch - off;
+    if (new_guess == guess_utc) break;
+    guess_utc = new_guess;
+  }
+  return (uint64_t)guess_utc;
 }
 
 void setTime() {
@@ -410,6 +446,7 @@ void setTime() {
 
   Clock.setEpoch(epoch_utc, true);
   Clock.setClockMode(false);
+  Clock.clearOSF();
 
   LOG_PRINT("Epoch time updated : ", epoch_utc);
 }
@@ -460,10 +497,9 @@ byte calculateNextAlarmMinute()
   }
   else
   {
-    // [SINCE..23] ∪ [0..UNTIL]
-    uint8_t span = (24 - SINCE_MIN) + (UNTIL_MIN + 1);
+    uint8_t span = (60 - SINCE_MIN) + (UNTIL_MIN + 1);
     uint8_t r = esp_random() % span;
-    return (r < (24 - SINCE_MIN)) ? (SINCE_MIN + r) : (r - (24 - SINCE_MIN));
+    return (r < (60 - SINCE_MIN)) ? (SINCE_MIN + r) : (r - (60 - SINCE_MIN));
   }
 }
 
@@ -492,7 +528,7 @@ void setNextAlarm()
                        + (uint64_t)hour * 3600u
                        + (uint64_t)minute * 60u;
 
-  if (dayAdd == 0 && targetLocal - SLEEP_LIMIT_SECONDS <= nowLocal)
+  if (dayAdd == 0 && targetLocal <= nowLocal + SLEEP_LIMIT_SECONDS)
   {
     targetLocal += 86400ull;
   }
@@ -516,7 +552,7 @@ void printMusicList(void)
     LOG_PRINT("The SD card audio file scan is empty, please check whether there are audio files in the SD card that meet the format!");
   }
 
-  while (musicList[numberOfTracks].length())
+  while (numberOfTracks < 100 && musicList[numberOfTracks].length())
   {
     numberOfTracks++;
   }
